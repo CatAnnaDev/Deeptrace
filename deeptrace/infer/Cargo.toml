@@ -1,0 +1,11 @@
+[package]
+name = "infer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "infer"
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = "1.0.100"

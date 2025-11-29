@@ -1,0 +1,13 @@
+[package]
+name = "core"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "core"
+path = "src/lib.rs"
+
+[dependencies]
+pcap = "2.4.0"
+bytes = "1.11.0"
+anyhow = "1.0.100"
