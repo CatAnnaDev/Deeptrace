@@ -1,6 +1,6 @@
-use std::ffi::CString;
 use libc::c_char;
 use serde::Serialize;
+use std::ffi::CString;
 
 /// Small, stable FFI for plugins.
 ///

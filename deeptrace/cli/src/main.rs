@@ -12,7 +12,6 @@ struct Opts {
 
 
 fn main() -> anyhow::Result<()> {
-
     let opts = Opts::parse();
     if opts.ui {
         println!("Starting UI...");

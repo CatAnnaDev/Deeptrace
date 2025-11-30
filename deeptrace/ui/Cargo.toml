@@ -1,15 +1,16 @@
 [package]
 name = "ui"
 version = "0.1.0"
-edition = "2024"
+edition = "2021"
 
 [dependencies]
 egui = "0.33.2"
 eframe = "0.33.2"
 anyhow = "1.0.100"
-core = {path = "../core"}
+core = { path = "../core" }
+proto = { path = "../proto" }
 chrono = "0.4.42"
-pnet = { version = "0.35", features = ["std"] }
+pnet = "0.35"
 httparse = "1.10.1"
 
 [lib]

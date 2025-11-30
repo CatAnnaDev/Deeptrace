@@ -1,6 +1,6 @@
-use std::ffi::c_char;
 use plugins_sdk::json_to_c_ptr;
 use serde::Serialize;
+use std::ffi::c_char;
 
 /// Example plugin exposing `decode_packet` C ABI function.
 #[derive(Serialize)]
