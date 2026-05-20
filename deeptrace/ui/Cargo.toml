@@ -9,6 +9,8 @@ eframe = "0.33.2"
 anyhow = "1.0.100"
 core = { path = "../core" }
 proto = { path = "../proto" }
+plugins_sdk = { path = "../plugins_sdk" }
+serde_json = "1.0.145"
 chrono = "0.4.42"
 pnet = "0.35"
 httparse = "1.10.1"

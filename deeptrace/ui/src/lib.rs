@@ -9,8 +9,9 @@ use pnet::packet::ipv6::Ipv6Packet;
 use pnet::packet::tcp::TcpPacket;
 use pnet::packet::udp::UdpPacket;
 use pnet::packet::Packet;
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Instant;
 
@@ -41,7 +42,7 @@ struct PacketInfo {
     path: String,
     status: String,
     size: usize,
-    raw_data: String,
+    raw_data: Arc<[u8]>,
     protocol: String,
     src_ip: String,
     dst_ip: String,
@@ -211,16 +212,29 @@ impl FilterConfig {
 }
 
 struct MyApp {
-    packets: Arc<Mutex<Vec<PacketInfo>>>,
+    rx: mpsc::Receiver<PacketInfo>,
     statistics: Arc<Mutex<Statistics>>,
-    selected_packet: Option<usize>,
+    /// UI-owned ring buffer. The capture thread never touches this, so it
+    /// can't evict or reorder packets the user is looking at.
+    packets: VecDeque<PacketInfo>,
+    max_packets: usize,
+    /// Cached indices into `packets` that pass the current filter/search.
+    /// Recomputed only when the data or the filter actually changes.
+    filtered: Vec<usize>,
+    filter_dirty: bool,
+    last_filter_sig: String,
+    selected_id: Option<usize>,
     detail_tab: DetailTab,
     filter_config: FilterConfig,
     show_filters: bool,
     show_statistics: bool,
-    paused: bool,
+    paused: Arc<AtomicBool>,
+    /// `true` = follow the live tail. `false` = frozen snapshot: no new
+    /// packets enter the view, nothing is evicted, selection stays put.
+    live: bool,
     search_query: String,
-    auto_scroll: bool,
+    plugins: plugins_sdk::host::PluginRegistry,
+    show_plugin_manager: bool,
 }
 
 #[derive(PartialEq)]
@@ -230,14 +244,20 @@ enum DetailTab {
     HexDump,
     Payload,
     Auto,
+    Plugins,
 }
 
 impl MyApp {
     pub fn new() -> Self {
-        let packets = Arc::new(Mutex::new(vec![]));
         let statistics = Arc::new(Mutex::new(Statistics::new()));
-        let packets_thread = packets.clone();
         let stats_thread = statistics.clone();
+        let paused = Arc::new(AtomicBool::new(false));
+        let paused_thread = paused.clone();
+        // Bounded channel: when the UI is frozen and stops draining, the
+        // capture thread blocks on `send` and the OS drops packets at the
+        // socket — instead of us growing memory unbounded or evicting the
+        // packets the user is currently inspecting.
+        let (tx, rx) = mpsc::sync_channel::<PacketInfo>(16_384);
 
         thread::spawn(move || {
             let mut cap = core::capture::LiveCapture::open_default()
@@ -248,6 +268,13 @@ impl MyApp {
             let mut counter = 0;
 
             loop {
+                // Honor the pause button: keep draining the device so the
+                // kernel buffer doesn't pile up, but don't store anything.
+                if paused_thread.load(Ordering::Relaxed) {
+                    cap.next();
+                    continue;
+                }
+
                 if let Some(data) = cap.next() {
                     counter += 1;
                     if let Some(parsed) = parse_packet(data.data, counter) {
@@ -255,56 +282,129 @@ impl MyApp {
                             let mut stats = stats_thread.lock().unwrap();
                             stats.update(&parsed);
                         }
-
-                        let mut lock = packets_thread.lock().unwrap();
-                        lock.push(parsed);
-                        if lock.len() > 5000 {
-                            lock.remove(0);
+                        if tx.send(parsed).is_err() {
+                            break; // UI dropped the receiver; stop capturing.
                         }
+                    } else {
+                        println!("Error parsing packet{counter}: {:?}", data.data);
                     }
                 }
             }
         });
 
         Self {
-            packets,
+            rx,
             statistics,
-            selected_packet: None,
+            packets: VecDeque::new(),
+            max_packets: 5000,
+            filtered: Vec::new(),
+            filter_dirty: true,
+            last_filter_sig: String::new(),
+            selected_id: None,
             detail_tab: DetailTab::Overview,
             filter_config: FilterConfig::default(),
             show_filters: false,
             show_statistics: true,
-            paused: false,
+            paused,
+            live: true,
             search_query: String::new(),
-            auto_scroll: true,
+            plugins: plugins_sdk::host::PluginRegistry::from_default_dirs(),
+            show_plugin_manager: false,
         }
     }
 
-    fn get_filtered_packets(&self) -> Vec<(usize, PacketInfo)> {
-        let packets = self.packets.lock().unwrap();
-        packets
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| self.filter_config.matches(p))
-            .filter(|(_, p)| {
-                if self.search_query.is_empty() {
-                    return true;
-                }
-                let query = self.search_query.to_lowercase();
-                p.host.to_lowercase().contains(&query)
+    /// Cheap fingerprint of everything that affects which packets are shown.
+    /// Used to avoid re-filtering thousands of packets every single frame.
+    fn filter_signature(&self) -> String {
+        let f = &self.filter_config;
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}{}{}{}{}{}|{}",
+            f.enabled,
+            f.protocol_filter,
+            f.host_filter,
+            f.port_filter,
+            f.method_filter,
+            f.min_size,
+            f.max_size,
+            f.show_tcp as u8,
+            f.show_udp as u8,
+            f.show_http as u8,
+            f.show_https as u8,
+            f.show_dns as u8,
+            f.show_other as u8,
+            self.search_query,
+        )
+    }
+
+    fn recompute_filtered(&mut self) {
+        let query = self.search_query.to_lowercase();
+        self.filtered.clear();
+        for (i, p) in self.packets.iter().enumerate() {
+            if !self.filter_config.matches(p) {
+                continue;
+            }
+            if !query.is_empty()
+                && !(p.host.to_lowercase().contains(&query)
                     || p.method.to_lowercase().contains(&query)
                     || p.path.to_lowercase().contains(&query)
                     || p.src_ip.contains(&query)
                     || p.dst_ip.contains(&query)
-                    || p.protocol.to_lowercase().contains(&query)
-            })
-            .map(|(idx, p)| (idx, p.clone()))
-            .collect()
+                    || p.protocol.to_lowercase().contains(&query))
+            {
+                continue;
+            }
+            self.filtered.push(i);
+        }
+    }
+
+    /// Pull newly captured packets into the UI buffer. Only runs while live;
+    /// frozen leaves them queued in the channel so the view stays stable.
+    fn ingest(&mut self) {
+        if !self.live || self.paused.load(Ordering::Relaxed) {
+            return;
+        }
+        let mut got = false;
+        // Bound work per frame so a traffic burst can't stall the UI thread.
+        for _ in 0..20_000 {
+            match self.rx.try_recv() {
+                Ok(p) => {
+                    self.packets.push_back(p);
+                    if self.packets.len() > self.max_packets {
+                        self.packets.pop_front();
+                    }
+                    got = true;
+                }
+                Err(_) => break,
+            }
+        }
+        if got {
+            self.filter_dirty = true;
+        }
+    }
+
+    /// Run ingest + (lazy) re-filter once per frame, before drawing.
+    fn sync(&mut self) {
+        self.ingest();
+        let sig = self.filter_signature();
+        if sig != self.last_filter_sig {
+            self.last_filter_sig = sig;
+            self.filter_dirty = true;
+            // Touching a filter means the user wants to study the result:
+            // freeze so the capture can't shift/evict it underneath them.
+            self.live = false;
+        }
+        if self.filter_dirty {
+            self.recompute_filtered();
+            self.filter_dirty = false;
+        }
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Pull new packets + refresh the filtered view exactly once, up front.
+        self.sync();
+
         // Top bar
         egui::TopBottomPanel::top("top_bar").show(ctx, |ui| {
             ui.add_space(6.0);
@@ -320,25 +420,46 @@ impl eframe::App for MyApp {
                 ui.label(format!("💾 {}", format_bytes(stats.total_bytes)));
 
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let is_paused = self.paused.load(Ordering::Relaxed);
                     if ui
-                        .button(if self.paused {
-                            "▶ Resume"
-                        } else {
-                            "⏸ Pause"
-                        })
+                        .button(if is_paused { "▶ Resume" } else { "⏸ Pause" })
                         .clicked()
                     {
-                        self.paused = !self.paused;
+                        self.paused.store(!is_paused, Ordering::Relaxed);
                     }
 
                     if ui.button("🗑 Clear").clicked() {
-                        self.packets.lock().unwrap().clear();
-                        self.selected_packet = None;
+                        self.packets.clear();
+                        self.filtered.clear();
+                        self.filter_dirty = true;
+                        self.selected_id = None;
                         *self.statistics.lock().unwrap() = Statistics::new();
+                    }
+
+                    // Live vs frozen. Clicking a packet or editing a filter
+                    // also flips this to frozen automatically.
+                    if self.live {
+                        if ui.button("❚❚ Freeze").clicked() {
+                            self.live = false;
+                        }
+                    } else if ui
+                        .button(
+                            egui::RichText::new("▶ Go Live")
+                                .color(Color32::from_rgb(72, 187, 120)),
+                        )
+                        .clicked()
+                    {
+                        self.live = true;
+                        self.selected_id = None;
+                        self.filter_dirty = true;
                     }
 
                     ui.checkbox(&mut self.show_statistics, "📈 Stats");
                     ui.checkbox(&mut self.show_filters, "🔧 Filters");
+                    ui.checkbox(
+                        &mut self.show_plugin_manager,
+                        format!("🧩 Plugins ({})", self.plugins.len()),
+                    );
                 });
             });
             ui.add_space(6.0);
@@ -509,7 +630,7 @@ impl eframe::App for MyApp {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
                     ui.label("🔍 Search:");
-                    let response = ui.add(
+                    ui.add(
                         egui::TextEdit::singleline(&mut self.search_query)
                             .desired_width(300.0)
                             .hint_text("Search in host, method, path, IP..."),
@@ -520,7 +641,12 @@ impl eframe::App for MyApp {
                     }
 
                     ui.separator();
-                    ui.checkbox(&mut self.auto_scroll, "Auto-scroll");
+                    let was_live = self.live;
+                    ui.checkbox(&mut self.live, "Live (suivre le flux)");
+                    if self.live && !was_live {
+                        self.selected_id = None;
+                        self.filter_dirty = true;
+                    }
                 });
                 ui.add_space(4.0);
             });
@@ -533,10 +659,22 @@ impl eframe::App for MyApp {
             .show(ctx, |ui| {
                 ui.add_space(4.0);
 
-                let filtered = self.get_filtered_packets();
+                let total = self.packets.len();
+                let shown = self.filtered.len();
                 ui.horizontal(|ui| {
                     ui.heading("Packets");
-                    ui.label(format!("({} displayed)", filtered.len()));
+                    ui.label(format!("({shown} / {total})"));
+                    if !self.live {
+                        ui.label(
+                            egui::RichText::new("● FROZEN")
+                                .color(Color32::from_rgb(246, 173, 85))
+                                .strong(),
+                        )
+                        .on_hover_text(
+                            "Capture continues in the background. \
+                             Press \"▶ Go Live\" to resume following.",
+                        );
+                    }
                 });
                 ui.separator();
 
@@ -560,43 +698,44 @@ impl eframe::App for MyApp {
                 });
                 ui.separator();
 
-                let mut scroll_area = ScrollArea::vertical();
-                if self.auto_scroll {
-                    scroll_area = scroll_area.stick_to_bottom(true);
-                }
+                let follow = self.live && !self.paused.load(Ordering::Relaxed);
+                let selected = self.selected_id;
+                let mut clicked: Option<usize> = None;
 
-                scroll_area.show(ui, |ui| {
-                    for (original_idx, packet) in filtered.iter().rev() {
-                        let is_selected = self.selected_packet == Some(*original_idx);
+                ScrollArea::vertical()
+                    .stick_to_bottom(follow)
+                    .show(ui, |ui| {
+                        for &idx in &self.filtered {
+                            let packet = &self.packets[idx];
+                            let is_selected = selected == Some(packet.id);
 
-                        let response = ui.add(
-                            egui::Button::new("")
-                                .frame(true)
-                                .fill(if is_selected {
-                                    Color32::from_rgb(45, 55, 72)
-                                } else {
-                                    Color32::from_rgb(26, 32, 44)
-                                })
-                                .stroke(Stroke::new(
-                                    1.0,
-                                    if is_selected {
-                                        Color32::from_rgb(66, 153, 225)
-                                    } else {
+                            let response = ui.add(
+                                egui::Button::new("")
+                                    .frame(true)
+                                    .fill(if is_selected {
                                         Color32::from_rgb(45, 55, 72)
-                                    },
-                                ))
-                                .corner_radius(Rounding::same(4))
-                                .min_size(Vec2::new(ui.available_width(), 40.0)),
-                        );
+                                    } else {
+                                        Color32::from_rgb(26, 32, 44)
+                                    })
+                                    .stroke(Stroke::new(
+                                        1.0_f32,
+                                        if is_selected {
+                                            Color32::from_rgb(66, 153, 225)
+                                        } else {
+                                            Color32::from_rgb(45, 55, 72)
+                                        },
+                                    ))
+                                    .corner_radius(Rounding::same(4))
+                                    .min_size(Vec2::new(ui.available_width(), 40.0)),
+                            );
 
-                        let rect = response.rect;
+                            let rect = response.rect;
 
-                        if response.clicked() {
-                            self.selected_packet = Some(*original_idx);
-                            self.auto_scroll = false;
-                        }
+                            if response.clicked() {
+                                clicked = Some(packet.id);
+                            }
 
-                        ui.allocate_ui_at_rect(rect, |ui| {
+                            ui.scope_builder(egui::UiBuilder::new().max_rect(rect), |ui| {
                             ui.horizontal(|ui| {
                                 ui.add_space(8.0);
 
@@ -651,13 +790,24 @@ impl eframe::App for MyApp {
                         ui.add_space(2.0);
                     }
                 });
+
+                if let Some(id) = clicked {
+                    self.selected_id = Some(id);
+                    // Inspecting a packet freezes the stream so the row you
+                    // clicked can't scroll away or be evicted underneath you.
+                    self.live = false;
+                }
             });
 
         // Central panel - packet details
         egui::CentralPanel::default().show(ctx, |ui| {
-            if let Some(selected_idx) = self.selected_packet {
-                let packets = self.packets.lock().unwrap();
-                if let Some(packet) = packets.get(selected_idx) {
+            if let Some(selected_id) = self.selected_id {
+                let packet = self
+                    .packets
+                    .iter()
+                    .find(|p| p.id == selected_id)
+                    .cloned();
+                if let Some(packet) = packet {
                     ui.add_space(4.0);
 
                     // Header info
@@ -725,6 +875,15 @@ impl eframe::App for MyApp {
                             .clicked()
                         {
                             self.detail_tab = DetailTab::Auto;
+                        }
+                        if ui
+                            .selectable_label(
+                                self.detail_tab == DetailTab::Plugins,
+                                format!("🧩 Plugins ({})", self.plugins.len()),
+                            )
+                            .clicked()
+                        {
+                            self.detail_tab = DetailTab::Plugins;
                         }
                     });
 
@@ -860,7 +1019,7 @@ impl eframe::App for MyApp {
                                 .corner_radius(Rounding::same(4))
                                 .inner_margin(Margin::same(8))
                                 .show(ui, |ui| {
-                                    ui.monospace(&packet.raw_data);
+                                    ui.monospace(create_enhanced_hex_dump(&packet.raw_data));
                                 });
                         }
                         DetailTab::Payload => {
@@ -874,7 +1033,7 @@ impl eframe::App for MyApp {
                                             "Payload Size: {} bytes\n\n",
                                             packet.payload_size
                                         ));
-                                        ui.monospace(&packet.raw_data);
+                                        ui.monospace(create_enhanced_hex_dump(&packet.raw_data));
                                     } else {
                                         ui.monospace("No payload data available");
                                     }
@@ -886,14 +1045,78 @@ impl eframe::App for MyApp {
                                 .corner_radius(Rounding::same(4))
                                 .inner_margin(Margin::same(8))
                                 .show(ui, |ui| {
-                                    ui.monospace(
-                                        &proto::msgpack_decoder::auto_parse(
-                                            packet.raw_data.as_ref(),
-                                        )
-                                        .unwrap()
-                                        .to_string(),
-                                    );
+                                    match proto::msgpack_decoder::auto_parse(&packet.raw_data) {
+                                        Ok(parsed) => {
+                                            ui.monospace(parsed.to_string());
+                                        }
+                                        Err(e) => {
+                                            ui.monospace(format!(
+                                                "Could not auto-parse payload: {e}"
+                                            ));
+                                        }
+                                    }
                                 });
+                        }
+                        DetailTab::Plugins => {
+                            if self.plugins.is_empty() {
+                                ui.label(
+                                    egui::RichText::new(
+                                        "No plugins loaded. Build a cdylib with the \
+                                         plugins_sdk and drop it in ./plugins or \
+                                         target/debug.",
+                                    )
+                                    .color(Color32::GRAY),
+                                );
+                            } else {
+                                ui.horizontal_wrapped(|ui| {
+                                    ui.label(
+                                        egui::RichText::new("Loaded:").strong(),
+                                    );
+                                    for name in self.plugins.names() {
+                                        ui.label(
+                                            egui::RichText::new(name)
+                                                .color(Color32::from_rgb(72, 187, 120)),
+                                        );
+                                    }
+                                });
+                                ui.separator();
+
+                                let results =
+                                    self.plugins.decode_all(&packet.raw_data);
+                                if results.is_empty() {
+                                    ui.label(
+                                        egui::RichText::new(
+                                            "No plugin matched this payload.",
+                                        )
+                                        .color(Color32::GRAY),
+                                    );
+                                } else {
+                                    for (name, value) in results {
+                                        ui.add_space(6.0);
+                                        ui.label(
+                                            egui::RichText::new(format!("▸ {name}"))
+                                                .strong()
+                                                .color(Color32::from_rgb(
+                                                    66, 153, 225,
+                                                )),
+                                        );
+                                        Frame::NONE
+                                            .fill(Color32::from_rgb(17, 24, 39))
+                                            .corner_radius(Rounding::same(4))
+                                            .inner_margin(Margin::same(8))
+                                            .show(ui, |ui| {
+                                                ui.monospace(
+                                                    serde_json::to_string_pretty(
+                                                        &value,
+                                                    )
+                                                    .unwrap_or_else(|_| {
+                                                        value.to_string()
+                                                    }),
+                                                );
+                                            });
+                                    }
+                                }
+                            }
                         }
                     });
                 } else {
@@ -920,14 +1143,144 @@ impl eframe::App for MyApp {
             }
         });
 
-        if !self.paused {
-            ctx.request_repaint();
+        // Plugin manager window
+        if self.show_plugin_manager {
+            let rows: Vec<(String, String, String, u32)> = self
+                .plugins
+                .plugins()
+                .iter()
+                .map(|p| {
+                    (
+                        p.name().to_string(),
+                        p.description().to_string(),
+                        p.path().display().to_string(),
+                        p.abi_version(),
+                    )
+                })
+                .collect();
+            let errors: Vec<(String, String)> = self
+                .plugins
+                .errors()
+                .iter()
+                .map(|e| (e.path.display().to_string(), e.error.clone()))
+                .collect();
+            let scanned: Vec<String> = self
+                .plugins
+                .scanned_dirs()
+                .iter()
+                .map(|d| d.display().to_string())
+                .collect();
+
+            let mut open = self.show_plugin_manager;
+            let mut reload = false;
+            egui::Window::new("🧩 Plugin Manager")
+                .open(&mut open)
+                .resizable(true)
+                .default_width(640.0)
+                .show(ctx, |ui| {
+                    ui.horizontal(|ui| {
+                        if ui.button("🔄 Reload").clicked() {
+                            reload = true;
+                        }
+                        ui.label(format!("{} loaded", rows.len()));
+                        if !errors.is_empty() {
+                            ui.label(
+                                egui::RichText::new(format!(
+                                    "{} failed",
+                                    errors.len()
+                                ))
+                                .color(Color32::from_rgb(245, 101, 101)),
+                            );
+                        }
+                    });
+                    ui.separator();
+
+                    ScrollArea::vertical().show(ui, |ui| {
+                        if rows.is_empty() {
+                            ui.label(
+                                egui::RichText::new(
+                                    "No plugins loaded. Build a cdylib with \
+                                     plugins_sdk and drop it in ./plugins or \
+                                     target/debug, then press Reload.",
+                                )
+                                .color(Color32::GRAY),
+                            );
+                        }
+                        for (name, desc, path, abi) in &rows {
+                            ui.group(|ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(name)
+                                            .strong()
+                                            .color(Color32::from_rgb(72, 187, 120)),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(format!("ABI v{abi}"))
+                                            .small()
+                                            .color(Color32::GRAY),
+                                    );
+                                });
+                                if !desc.is_empty() {
+                                    ui.label(desc);
+                                }
+                                ui.label(
+                                    egui::RichText::new(path)
+                                        .small()
+                                        .color(Color32::DARK_GRAY),
+                                );
+                            });
+                        }
+
+                        if !errors.is_empty() {
+                            ui.add_space(8.0);
+                            ui.label(
+                                egui::RichText::new("Failed to load")
+                                    .strong()
+                                    .color(Color32::from_rgb(245, 101, 101)),
+                            );
+                            for (path, err) in &errors {
+                                ui.group(|ui| {
+                                    ui.label(
+                                        egui::RichText::new(path)
+                                            .small()
+                                            .color(Color32::DARK_GRAY),
+                                    );
+                                    ui.label(
+                                        egui::RichText::new(err)
+                                            .color(Color32::from_rgb(245, 101, 101)),
+                                    );
+                                });
+                            }
+                        }
+
+                        ui.add_space(8.0);
+                        ui.collapsing("Scanned directories", |ui| {
+                            for d in &scanned {
+                                ui.label(
+                                    egui::RichText::new(d)
+                                        .small()
+                                        .color(Color32::GRAY),
+                                );
+                            }
+                        });
+                    });
+                });
+            self.show_plugin_manager = open;
+            if reload {
+                self.plugins.reload();
+            }
+        }
+
+        // Throttle refreshes: ~10 fps is plenty for a live packet list and
+        // avoids the previous busy-loop that pinned a CPU core at 100%.
+        if !self.paused.load(Ordering::Relaxed) {
+            //ctx.request_repaint_after(Duration::from_millis(100));
         }
     }
 }
 
 fn parse_packet(data: &[u8], counter: usize) -> Option<PacketInfo> {
-    let dump = create_enhanced_hex_dump(data);
+    let raw: Arc<[u8]> = Arc::from(data);
     let timestamp = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
     let instant = Instant::now();
 
@@ -935,7 +1288,7 @@ fn parse_packet(data: &[u8], counter: usize) -> Option<PacketInfo> {
         Some(eth) => eth,
         None => {
             return Some(create_default_packet(
-                counter, timestamp, instant, data, dump,
+                counter, timestamp, instant, data, raw,
             ))
         }
     };
@@ -943,12 +1296,12 @@ fn parse_packet(data: &[u8], counter: usize) -> Option<PacketInfo> {
     match ethernet.get_ethertype() {
         EtherTypes::Ipv4 => {
             if let Some(ipv4) = Ipv4Packet::new(ethernet.payload()) {
-                return parse_ipv4_packet(&ipv4, counter, timestamp, instant, data.len(), dump);
+                return parse_ipv4_packet(&ipv4, counter, timestamp, instant, data.len(), raw);
             }
         }
         EtherTypes::Ipv6 => {
             if let Some(ipv6) = Ipv6Packet::new(ethernet.payload()) {
-                return parse_ipv6_packet(&ipv6, counter, timestamp, instant, data.len(), dump);
+                return parse_ipv6_packet(&ipv6, counter, timestamp, instant, data.len(), raw);
             }
         }
         EtherTypes::Arp => {
@@ -961,7 +1314,7 @@ fn parse_packet(data: &[u8], counter: usize) -> Option<PacketInfo> {
                 path: "-".to_string(),
                 status: "-".to_string(),
                 size: data.len(),
-                raw_data: dump,
+                raw_data: raw.clone(),
                 protocol: "ARP".to_string(),
                 src_ip: "N/A".to_string(),
                 dst_ip: "N/A".to_string(),
@@ -981,7 +1334,7 @@ fn parse_packet(data: &[u8], counter: usize) -> Option<PacketInfo> {
                 path: "-".to_string(),
                 status: "-".to_string(),
                 size: data.len(),
-                raw_data: dump,
+                raw_data: raw.clone(),
                 protocol: "WOL".to_string(),
                 src_ip: "N/A".to_string(),
                 dst_ip: "N/A".to_string(),
@@ -995,7 +1348,7 @@ fn parse_packet(data: &[u8], counter: usize) -> Option<PacketInfo> {
     }
 
     Some(create_default_packet(
-        counter, timestamp, instant, data, dump,
+        counter, timestamp, instant, data, raw,
     ))
 }
 
@@ -1005,7 +1358,7 @@ fn parse_ipv4_packet(
     timestamp: String,
     instant: Instant,
     total_size: usize,
-    dump: String,
+    raw: Arc<[u8]>,
 ) -> Option<PacketInfo> {
     let src_ip = ipv4.get_source().to_string();
     let dst_ip = ipv4.get_destination().to_string();
@@ -1014,7 +1367,7 @@ fn parse_ipv4_packet(
         IpNextHeaderProtocols::Tcp => {
             if let Some(tcp) = TcpPacket::new(ipv4.payload()) {
                 return parse_tcp_packet(
-                    &tcp, src_ip, dst_ip, counter, timestamp, instant, total_size, dump,
+                    &tcp, src_ip, dst_ip, counter, timestamp, instant, total_size, raw,
                 );
             }
         }
@@ -1040,7 +1393,7 @@ fn parse_ipv4_packet(
                     path: format!("from {}", src_ip),
                     status: "-".to_string(),
                     size: total_size,
-                    raw_data: dump,
+                    raw_data: raw.clone(),
                     protocol: protocol.to_string(),
                     src_ip,
                     dst_ip,
@@ -1061,7 +1414,7 @@ fn parse_ipv4_packet(
                 path: format!("from {}", src_ip),
                 status: "-".to_string(),
                 size: total_size,
-                raw_data: dump,
+                raw_data: raw.clone(),
                 protocol: "ICMP".to_string(),
                 src_ip,
                 dst_ip,
@@ -1083,7 +1436,7 @@ fn parse_ipv4_packet(
         path: format!("from {}", src_ip),
         status: "-".to_string(),
         size: total_size,
-        raw_data: dump,
+        raw_data: raw.clone(),
         protocol: "IPv4".to_string(),
         src_ip,
         dst_ip,
@@ -1100,7 +1453,7 @@ fn parse_ipv6_packet(
     timestamp: String,
     instant: Instant,
     total_size: usize,
-    dump: String,
+    raw: Arc<[u8]>,
 ) -> Option<PacketInfo> {
     let src_ip = ipv6.get_source().to_string();
     let dst_ip = ipv6.get_destination().to_string();
@@ -1109,7 +1462,7 @@ fn parse_ipv6_packet(
         IpNextHeaderProtocols::Tcp => {
             if let Some(tcp) = TcpPacket::new(ipv6.payload()) {
                 return parse_tcp_packet(
-                    &tcp, src_ip, dst_ip, counter, timestamp, instant, total_size, dump,
+                    &tcp, src_ip, dst_ip, counter, timestamp, instant, total_size, raw,
                 );
             }
         }
@@ -1134,7 +1487,7 @@ fn parse_ipv6_packet(
                     path: format!("from {}", src_ip),
                     status: "-".to_string(),
                     size: total_size,
-                    raw_data: dump,
+                    raw_data: raw.clone(),
                     protocol: protocol.to_string(),
                     src_ip,
                     dst_ip,
@@ -1157,7 +1510,7 @@ fn parse_ipv6_packet(
         path: format!("from {}", src_ip),
         status: "-".to_string(),
         size: total_size,
-        raw_data: dump,
+        raw_data: raw.clone(),
         protocol: "IPv6".to_string(),
         src_ip,
         dst_ip,
@@ -1176,7 +1529,7 @@ fn parse_tcp_packet(
     timestamp: String,
     instant: Instant,
     total_size: usize,
-    dump: String,
+    raw: Arc<[u8]>,
 ) -> Option<PacketInfo> {
     let src_port = tcp.get_source();
     let dst_port = tcp.get_destination();
@@ -1193,7 +1546,7 @@ fn parse_tcp_packet(
             path: format!("from {}", src_ip),
             status: "-".to_string(),
             size: total_size,
-            raw_data: dump,
+            raw_data: raw.clone(),
             protocol: "TCP".to_string(),
             src_ip,
             dst_ip,
@@ -1215,7 +1568,7 @@ fn parse_tcp_packet(
             path: http_info.path,
             status: "→".to_string(),
             size: total_size,
-            raw_data: dump,
+            raw_data: raw.clone(),
             protocol: http_info.method,
             src_ip,
             dst_ip,
@@ -1237,7 +1590,7 @@ fn parse_tcp_packet(
             path: http_info.reason,
             status: http_info.status_code,
             size: total_size,
-            raw_data: dump,
+            raw_data: raw.clone(),
             protocol: "HTTP".to_string(),
             src_ip,
             dst_ip,
@@ -1277,7 +1630,7 @@ fn parse_tcp_packet(
         path: format!("from {}", src_ip),
         status: "-".to_string(),
         size: total_size,
-        raw_data: dump,
+        raw_data: raw.clone(),
         protocol: protocol.to_string(),
         src_ip,
         dst_ip,
@@ -1323,7 +1676,7 @@ fn create_default_packet(
     timestamp: String,
     instant: Instant,
     data: &[u8],
-    dump: String,
+    raw: Arc<[u8]>,
 ) -> PacketInfo {
     PacketInfo {
         id: counter,
@@ -1334,7 +1687,7 @@ fn create_default_packet(
         path: "-".to_string(),
         status: "-".to_string(),
         size: data.len(),
-        raw_data: dump,
+        raw_data: raw.clone(),
         protocol: "RAW".to_string(),
         src_ip: "N/A".to_string(),
         dst_ip: "N/A".to_string(),
@@ -1493,15 +1846,20 @@ fn get_protocol_color(protocol: &str) -> Color32 {
 }
 
 fn truncate_string(s: &str, max_len: usize) -> String {
-    if s.len() <= max_len {
+    // Count/slice by `char`, not by byte: slicing a multi-byte UTF-8
+    // string on a byte offset panics, which used to crash the whole UI
+    // whenever a packet carried a non-ASCII host/path.
+    if s.chars().count() <= max_len {
         s.to_string()
     } else {
-        format!("{}...", &s[..max_len - 3])
+        let keep = max_len.saturating_sub(3);
+        let truncated: String = s.chars().take(keep).collect();
+        format!("{}...", truncated)
     }
 }
 
 fn truncate_ip(ip: &str) -> String {
-    if ip.len() > 15 {
+    if ip.chars().count() > 15 {
         truncate_string(ip, 15)
     } else {
         ip.to_string()

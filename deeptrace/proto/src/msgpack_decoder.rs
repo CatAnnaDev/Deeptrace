@@ -12,6 +12,9 @@ pub enum ParsedData {
     MsgPack(Value),
     Cbor(Value),
     Bson(Value),
+    Bencode(Value),
+    Protobuf(Value),
+    Form(Value),
     Yaml(Value),
     Toml(Value),
     Xml(String),
@@ -53,10 +56,12 @@ pub fn auto_parse(buf: &[u8]) -> Result<ParsedData> {
         }
         // Bzip2
         if buf[0..2] == [0x42, 0x5a] {
-            return Ok(ParsedData::Binary {
-                format: "bzip2".to_string(),
-                data: buf.to_vec(),
-            });
+            if let Ok(decompressed) = decompress_bzip2(buf) {
+                return Ok(ParsedData::Compressed {
+                    format: "bzip2".to_string(),
+                    decompressed,
+                });
+            }
         }
     }
 
@@ -111,6 +116,27 @@ pub fn auto_parse(buf: &[u8]) -> Result<ParsedData> {
             return Ok(ParsedData::Xml(trimmed.to_string()));
         }
 
+        // application/x-www-form-urlencoded (e.g. `a=1&b=hello%20world`)
+        if trimmed.contains('=')
+            && trimmed.contains('&')
+            && !trimmed.contains(char::is_whitespace)
+        {
+            if let Some(value) = parse_form_urlencoded(trimmed) {
+                return Ok(ParsedData::Form(value));
+            }
+        }
+
+        // Bencode is ASCII, so it has to be tried before the plain-text
+        // catch-all below or it would always be reported as text.
+        let first = trimmed.as_bytes().first();
+        if matches!(first, Some(b'd' | b'l' | b'i'))
+            || first.is_some_and(u8::is_ascii_digit)
+        {
+            if let Ok(value) = decode_bencode(trimmed.as_bytes()) {
+                return Ok(ParsedData::Bencode(value));
+            }
+        }
+
         // Plain text
         if is_printable_ascii(buf) || is_valid_utf8(buf) {
             return Ok(ParsedData::Text(text.to_string()));
@@ -134,12 +160,43 @@ pub fn auto_parse(buf: &[u8]) -> Result<ParsedData> {
         return Ok(ParsedData::Bson(value));
     }
 
+    // Bencode (BitTorrent / DHT). Strict: must consume the whole buffer.
+    if let Ok(value) = decode_bencode(buf) {
+        return Ok(ParsedData::Bencode(value));
+    }
+
+    // Protocol Buffers (schemaless). Strict: every byte must parse as a
+    // valid wire-format field, which keeps random data from matching.
+    if let Ok(value) = decode_protobuf_value(buf) {
+        return Ok(ParsedData::Protobuf(value));
+    }
+
     // LZ4 - no magic bytes, but try decompression
     if let Ok(decompressed) = decompress_lz4(buf) {
         return Ok(ParsedData::Compressed {
             format: "lz4".to_string(),
             decompressed,
         });
+    }
+
+    // Raw deflate / brotli have no magic bytes, so only accept them when the
+    // result is itself valid UTF-8 — otherwise almost anything "decompresses"
+    // into garbage and we'd mislabel plain binary.
+    if let Ok(decompressed) = decompress_deflate(buf) {
+        if !decompressed.is_empty() && is_valid_utf8(&decompressed) {
+            return Ok(ParsedData::Compressed {
+                format: "deflate".to_string(),
+                decompressed,
+            });
+        }
+    }
+    if let Ok(decompressed) = decompress_brotli(buf) {
+        if !decompressed.is_empty() && is_valid_utf8(&decompressed) {
+            return Ok(ParsedData::Compressed {
+                format: "brotli".to_string(),
+                decompressed,
+            });
+        }
     }
 
     // Detect by magic bytes for known formats
@@ -157,6 +214,9 @@ pub fn auto_parse_to_json(buf: &[u8]) -> Result<Value> {
         ParsedData::MsgPack(v) => Ok(v),
         ParsedData::Cbor(v) => Ok(v),
         ParsedData::Bson(v) => Ok(v),
+        ParsedData::Bencode(v) => Ok(v),
+        ParsedData::Protobuf(v) => Ok(v),
+        ParsedData::Form(v) => Ok(v),
         ParsedData::Yaml(v) => Ok(v),
         ParsedData::Toml(v) => Ok(v),
         ParsedData::Jwt { header, payload } => Ok(serde_json::json!({
@@ -199,6 +259,9 @@ pub fn describe_parsed_data(parsed: &ParsedData) -> String {
         ParsedData::MsgPack(_) => "MessagePack binary data".to_string(),
         ParsedData::Cbor(_) => "CBOR binary data".to_string(),
         ParsedData::Bson(_) => "BSON document".to_string(),
+        ParsedData::Bencode(_) => "Bencoded data (BitTorrent)".to_string(),
+        ParsedData::Protobuf(_) => "Protocol Buffers (schemaless)".to_string(),
+        ParsedData::Form(_) => "URL-encoded form data".to_string(),
         ParsedData::Yaml(_) => "YAML document".to_string(),
         ParsedData::Toml(_) => "TOML configuration".to_string(),
         ParsedData::Xml(_) => "XML document".to_string(),
@@ -227,6 +290,9 @@ impl Display for ParsedData {
             ParsedData::MsgPack(e) => e.to_string(),
             ParsedData::Cbor(e) => e.to_string(),
             ParsedData::Bson(e) => e.to_string(),
+            ParsedData::Bencode(e) => e.to_string(),
+            ParsedData::Protobuf(e) => e.to_string(),
+            ParsedData::Form(e) => e.to_string(),
             ParsedData::Yaml(e) => e.to_string(),
             ParsedData::Toml(e) => e.to_string(),
             ParsedData::Xml(e) => e.to_string(),
@@ -520,6 +586,228 @@ pub fn decompress_lz4(buf: &[u8]) -> Result<Vec<u8>> {
 /// Compress data with lz4
 pub fn compress_lz4(buf: &[u8]) -> Vec<u8> {
     lz4_flex::compress_prepend_size(buf)
+}
+
+/// Decompress bzip2 data
+pub fn decompress_bzip2(buf: &[u8]) -> Result<Vec<u8>> {
+    use bzip2::read::BzDecoder;
+    use std::io::Read;
+
+    let mut decoder = BzDecoder::new(buf);
+    let mut decompressed = Vec::new();
+    decoder.read_to_end(&mut decompressed)?;
+    Ok(decompressed)
+}
+
+/// Compress data with bzip2
+pub fn compress_bzip2(buf: &[u8]) -> Result<Vec<u8>> {
+    use bzip2::read::BzEncoder;
+    use bzip2::Compression;
+    use std::io::Read;
+
+    let mut encoder = BzEncoder::new(buf, Compression::default());
+    let mut compressed = Vec::new();
+    encoder.read_to_end(&mut compressed)?;
+    Ok(compressed)
+}
+
+// ============================================================================
+// BENCODE (BitTorrent / DHT)
+// ============================================================================
+
+/// Decode a bencoded buffer. Strict: the whole buffer must be consumed.
+pub fn decode_bencode(buf: &[u8]) -> Result<Value> {
+    let mut pos = 0;
+    let value = bencode_value(buf, &mut pos)?;
+    if pos != buf.len() {
+        anyhow::bail!("trailing bytes after bencode value");
+    }
+    Ok(value)
+}
+
+fn bencode_value(buf: &[u8], pos: &mut usize) -> Result<Value> {
+    match buf.get(*pos) {
+        Some(b'i') => {
+            // i<integer>e
+            *pos += 1;
+            let end = buf[*pos..]
+                .iter()
+                .position(|&b| b == b'e')
+                .ok_or_else(|| anyhow::anyhow!("unterminated bencode integer"))?;
+            let num: i64 = std::str::from_utf8(&buf[*pos..*pos + end])?.parse()?;
+            *pos += end + 1;
+            Ok(Value::from(num))
+        }
+        Some(b'l') => {
+            // l<items>e
+            *pos += 1;
+            let mut items = Vec::new();
+            while buf.get(*pos) != Some(&b'e') {
+                if *pos >= buf.len() {
+                    anyhow::bail!("unterminated bencode list");
+                }
+                items.push(bencode_value(buf, pos)?);
+            }
+            *pos += 1;
+            Ok(Value::Array(items))
+        }
+        Some(b'd') => {
+            // d<key><value>...e  (keys are byte strings)
+            *pos += 1;
+            let mut map = serde_json::Map::new();
+            while buf.get(*pos) != Some(&b'e') {
+                if *pos >= buf.len() {
+                    anyhow::bail!("unterminated bencode dict");
+                }
+                let key = bencode_byte_string(buf, pos)?;
+                let key = String::from_utf8_lossy(&key).into_owned();
+                let value = bencode_value(buf, pos)?;
+                map.insert(key, value);
+            }
+            *pos += 1;
+            Ok(Value::Object(map))
+        }
+        Some(c) if c.is_ascii_digit() => {
+            let bytes = bencode_byte_string(buf, pos)?;
+            match String::from_utf8(bytes.clone()) {
+                Ok(s) => Ok(Value::String(s)),
+                Err(_) => Ok(serde_json::json!({ "bytes_base64": encode_base64(&bytes) })),
+            }
+        }
+        _ => anyhow::bail!("invalid bencode marker"),
+    }
+}
+
+fn bencode_byte_string(buf: &[u8], pos: &mut usize) -> Result<Vec<u8>> {
+    let colon = buf[*pos..]
+        .iter()
+        .position(|&b| b == b':')
+        .ok_or_else(|| anyhow::anyhow!("invalid bencode string length"))?;
+    let len: usize = std::str::from_utf8(&buf[*pos..*pos + colon])?.parse()?;
+    let start = *pos + colon + 1;
+    let end = start
+        .checked_add(len)
+        .filter(|&e| e <= buf.len())
+        .ok_or_else(|| anyhow::anyhow!("bencode string out of bounds"))?;
+    *pos = end;
+    Ok(buf[start..end].to_vec())
+}
+
+// ============================================================================
+// FORM URL-ENCODED
+// ============================================================================
+
+/// Parse an `application/x-www-form-urlencoded` body into a JSON object.
+pub fn parse_form_urlencoded(s: &str) -> Option<Value> {
+    let mut map = serde_json::Map::new();
+    for pair in s.split('&') {
+        if pair.is_empty() {
+            continue;
+        }
+        let mut it = pair.splitn(2, '=');
+        let key = it.next()?;
+        if key.is_empty() {
+            return None;
+        }
+        let raw_val = it.next().unwrap_or("");
+        let key = urlencoding::decode(key)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| key.to_string());
+        let val = urlencoding::decode(raw_val)
+            .map(|c| c.into_owned())
+            .unwrap_or_else(|_| raw_val.to_string());
+        map.insert(key, Value::String(val));
+    }
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
+    }
+}
+
+// ============================================================================
+// PROTOBUF (schemaless, strict)
+// ============================================================================
+
+/// Decode protobuf wire format without a schema. Requires every byte to be a
+/// valid field so random binary doesn't get mislabeled as protobuf.
+pub fn decode_protobuf_value(buf: &[u8]) -> Result<Value> {
+    if buf.is_empty() {
+        anyhow::bail!("empty protobuf buffer");
+    }
+
+    let mut map = serde_json::Map::new();
+    let mut pos = 0;
+    let mut fields = 0;
+
+    while pos < buf.len() {
+        let (tag_wire, l1) =
+            decode_varint(&buf[pos..]).ok_or_else(|| anyhow::anyhow!("bad tag"))?;
+        let field = tag_wire >> 3;
+        let wire_type = (tag_wire & 0x07) as u8;
+        pos += l1;
+
+        let value = match wire_type {
+            0 => {
+                let (v, l) = decode_varint(&buf[pos..])
+                    .ok_or_else(|| anyhow::anyhow!("bad varint"))?;
+                pos += l;
+                serde_json::json!({ "varint": v })
+            }
+            1 => {
+                if pos + 8 > buf.len() {
+                    anyhow::bail!("short 64-bit field");
+                }
+                let v = encode_hex(&buf[pos..pos + 8]);
+                pos += 8;
+                serde_json::json!({ "fixed64_hex": v })
+            }
+            2 => {
+                let (len, l) = decode_varint(&buf[pos..])
+                    .ok_or_else(|| anyhow::anyhow!("bad length"))?;
+                pos += l;
+                let end = pos + len as usize;
+                if end > buf.len() {
+                    anyhow::bail!("length-delimited field out of bounds");
+                }
+                let bytes = &buf[pos..end];
+                pos = end;
+                match std::str::from_utf8(bytes) {
+                    Ok(s) if is_printable_ascii(bytes) || is_valid_utf8(bytes) => {
+                        serde_json::json!({ "string": s })
+                    }
+                    _ => serde_json::json!({ "bytes_hex": encode_hex(bytes) }),
+                }
+            }
+            5 => {
+                if pos + 4 > buf.len() {
+                    anyhow::bail!("short 32-bit field");
+                }
+                let v = encode_hex(&buf[pos..pos + 4]);
+                pos += 4;
+                serde_json::json!({ "fixed32_hex": v })
+            }
+            _ => anyhow::bail!("unsupported wire type {}", wire_type),
+        };
+
+        let key = format!("field_{}", field);
+        match map.get_mut(&key) {
+            Some(Value::Array(arr)) => arr.push(value),
+            Some(existing) => {
+                let prev = existing.take();
+                *existing = Value::Array(vec![prev, value]);
+            }
+            None => {
+                map.insert(key, value);
+            }
+        }
+        fields += 1;
+    }
+
+    if fields == 0 {
+        anyhow::bail!("no protobuf fields");
+    }
+    Ok(Value::Object(map))
 }
 
 // ============================================================================
@@ -900,4 +1188,55 @@ pub fn detect_format(buf: &[u8]) -> &'static str {
     }
 
     "binary"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bencode_dict_and_list() {
+        // d 4:spam l 1:a 1:b e e  ->  {"spam": ["a","b"]}
+        let v = decode_bencode(b"d4:spaml1:a1:bee").unwrap();
+        assert_eq!(v, serde_json::json!({ "spam": ["a", "b"] }));
+        assert_eq!(decode_bencode(b"i42e").unwrap(), serde_json::json!(42));
+        // Trailing garbage must be rejected (strictness).
+        assert!(decode_bencode(b"i42eX").is_err());
+    }
+
+    #[test]
+    fn form_urlencoded() {
+        let v = parse_form_urlencoded("a=1&b=hello%20world&c=").unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({ "a": "1", "b": "hello world", "c": "" })
+        );
+    }
+
+    #[test]
+    fn protobuf_string_field() {
+        // field 1, wire type 2 (len-delimited), "test"
+        let buf = [0x0a, 0x04, b't', b'e', b's', b't'];
+        let v = decode_protobuf_value(&buf).unwrap();
+        assert_eq!(v, serde_json::json!({ "field_1": { "string": "test" } }));
+    }
+
+    #[test]
+    fn bzip2_roundtrip() {
+        let data = b"DeepTrace bzip2 roundtrip payload, repeated repeated repeated";
+        let comp = compress_bzip2(data).unwrap();
+        assert_eq!(decompress_bzip2(&comp).unwrap(), data);
+    }
+
+    #[test]
+    fn auto_parse_routes_new_formats() {
+        match auto_parse(b"d3:foo3:bare").unwrap() {
+            ParsedData::Bencode(_) => {}
+            other => panic!("expected Bencode, got {other:?}"),
+        }
+        match auto_parse(b"x=1&y=2").unwrap() {
+            ParsedData::Form(_) => {}
+            other => panic!("expected Form, got {other:?}"),
+        }
+    }
 }

@@ -1,24 +1,44 @@
-use plugins_sdk::json_to_c_ptr;
-use serde::Serialize;
-use std::ffi::c_char;
+//! Example DeepTrace plugin.
+//!
+//! It demonstrates the full SDK: a single safe `fn(&[u8]) -> Result<Value>`
+//! wired up by `declare_plugin!`. This one is actually useful — it runs the
+//! `proto` auto-detection stack (JSON, MsgPack, CBOR, BSON, protobuf,
+//! bencode, gzip/zstd/bzip2/lz4, JWT, YAML/TOML, form-urlencoded, …) over the
+//! payload and returns a structured summary.
 
-/// Example plugin exposing `decode_packet` C ABI function.
-#[derive(Serialize)]
-struct Out<'a> {
-    ok: bool,
-    reason: &'a str,
+use anyhow::{bail, Result};
+use plugins_sdk::declare_plugin;
+use proto::msgpack_decoder::{auto_parse, auto_parse_to_json, describe_parsed_data};
+use serde_json::{json, Value};
+
+fn decode(data: &[u8]) -> Result<Value> {
+    // Skip payloads that are almost certainly framing noise so we act as a
+    // real "is this mine?" filter rather than matching everything.
+    if data.len() < 2 {
+        bail!("payload too small to classify");
+    }
+
+    let parsed = auto_parse(data)?;
+    let kind = describe_parsed_data(&parsed);
+
+    // Anything that's just opaque/plain bytes isn't interesting here.
+    if kind.starts_with("binary") || kind.starts_with("Plain text") {
+        bail!("no structured format detected ({kind})");
+    }
+
+    let decoded = auto_parse_to_json(data).unwrap_or(Value::Null);
+    Ok(json!({
+        "plugin": "auto-decode",
+        "detected": kind,
+        "bytes": data.len(),
+        "decoded": decoded,
+    }))
 }
 
-#[unsafe(no_mangle)]
-pub extern "C" fn decode_packet(data: *const u8, len: usize) -> *mut c_char {
-    if data.is_null() || len == 0 {
-        return std::ptr::null_mut();
-    }
-    let slice = unsafe { std::slice::from_raw_parts(data, len) };
-    if slice.len() > 0 && slice[0] == 0xAA {
-        let o = Out { ok: true, reason: "starts_with_0xAA" };
-        json_to_c_ptr(&o)
-    } else {
-        std::ptr::null_mut()
-    }
-}
+declare_plugin!(
+    "auto-decode",
+    "Runs the proto auto-detection stack (JSON, MsgPack, CBOR, BSON, \
+     protobuf, bencode, JWT, gzip/zstd/bzip2/lz4, YAML/TOML, form) over \
+     the payload and returns a structured summary.",
+    decode
+);
